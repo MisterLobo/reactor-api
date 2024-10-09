@@ -1,0 +1,7 @@
+#!/bin/bash
+
+PORT=2376
+DOCKERD_ROOTLESS_ROOTLESSKIT_FLAGS="-p 0.0.0.0:$PORT:$PORT/tcp" \
+  dockerd-rootless.sh \
+  -H $DOCKER_HOST \
+  -H tcp://0.0.0.0:$PORT
