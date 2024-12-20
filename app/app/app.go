@@ -3,11 +3,14 @@ package app
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"os"
+	"path"
+	"reactor/common"
 	"reactor/models"
 	"reactor/types"
 	"reactor/utils"
@@ -23,6 +26,7 @@ import (
 	"github.com/docker/docker/api/types/volume"
 	"github.com/docker/docker/client"
 	"github.com/docker/docker/pkg/stdcopy"
+	"github.com/docker/go-connections/nat"
 	"github.com/dustin/go-humanize"
 	"github.com/gin-gonic/gin"
 	"github.com/zishang520/socket.io/socket"
@@ -532,11 +536,11 @@ func (app *App) ContainerGet(params *types.ContainerGetParams) *types.ContainerS
 	cli := app.client
 	filterKV := make([]filters.KeyValuePair, 0)
 	filterKV = append(filterKV, filters.Arg("id", params.ID))
-	nameb := make([]byte, 0)
+	/* nameb := make([]byte, 0)
 	if params.Name != nil {
 		params.Name.UnmarshalJSON(nameb)
 		filterKV = append(filterKV, filters.Arg("name", string(nameb)))
-	}
+	} */
 	args := filters.NewArgs(filterKV...)
 	containers, err := cli.ContainerList(context.Background(), container.ListOptions{
 		All:     true,
@@ -647,6 +651,18 @@ func (app *App) ContainerCreate(params *types.ContainerCreateParams) (*types.Con
 		cfg.Env = env
 	}
 
+	fmt.Println("[config#ports]:", params.PortBindings)
+	/* if params.Explorable {
+		exposedPorts := params.ExposedPorts
+		portBindings := params.PortBindings
+		exposedPorts["45550"] = struct{}{}
+		portBindings["45500"] = []nat.PortBinding{
+			{
+				HostIP:   "",
+				HostPort: "",
+			},
+		}
+	} */
 	res, err := app.client.ContainerCreate(context.Background(), &container.Config{
 		Image:        params.Image,
 		AttachStdin:  params.Stdin,
@@ -660,8 +676,14 @@ func (app *App) ContainerCreate(params *types.ContainerCreateParams) (*types.Con
 		User:         params.User,
 		Shell:        params.Shell,
 		WorkingDir:   params.WorkingDir,
-	}, nil, nil, nil, name)
+		Volumes:      params.Volumes,
+		ExposedPorts: params.ExposedPorts,
+	}, &container.HostConfig{
+		Binds:        params.Binds,
+		PortBindings: params.PortBindings,
+	}, nil, nil, name)
 	if err != nil {
+		fmt.Println("error:", err.Error())
 		return nil, err
 	}
 	return &types.ContainerActionResult{
@@ -674,6 +696,9 @@ func (app *App) ContainerRun(params *types.ContainerCreateParams) (*types.Contai
 	if err != nil {
 		return nil, err
 	}
+	if params.Explorable {
+		app.SaveExplorable(res.ID)
+	}
 	/* err = app.client.ContainerRename(context.Background(), res.ID, params.Name)
 	if err != nil {
 		return nil, err
@@ -683,10 +708,43 @@ func (app *App) ContainerRun(params *types.ContainerCreateParams) (*types.Contai
 		if err != nil {
 			fmt.Println("error running container:", err.Error())
 		}
+		f, err := os.Open(path.Join(".tmp", "lsx.tar.gz"))
+		if err != nil {
+			log.Println("error checking archive:", err.Error())
+			return
+		}
+		defer f.Close()
+		app.client.CopyToContainer(context.Background(), res.ID, "/bin", f, container.CopyToContainerOptions{
+			AllowOverwriteDirWithFile: true,
+		})
 	}()
 	return &types.ContainerRunResponse{
 		ID: res.ID,
 	}, nil
+}
+func (app *App) UpdateLsBin(params *types.CommonRequestParams) error {
+	if common.DEBUG {
+		return nil
+	}
+	log.Printf("id: %s\n", params.ID)
+	go func() {
+		log.Println("updating binary. please wait...")
+		f, err := os.Open(path.Join(".tmp", "lsx.tar.gz"))
+		if err != nil {
+			log.Println("error checking archive:", err.Error())
+			return
+		}
+		defer f.Close()
+		err = app.client.CopyToContainer(context.Background(), params.ID, "/bin", f, container.CopyToContainerOptions{
+			AllowOverwriteDirWithFile: true,
+		})
+		if err != nil {
+			log.Println("error updating binary:", err.Error())
+			return
+		}
+		log.Println("update successful!")
+	}()
+	return nil
 }
 func (app *App) ContainerStart(params *types.ContainerRequestParams) error {
 	err := app.client.ContainerStart(context.Background(), params.ID, container.StartOptions{})
@@ -739,8 +797,32 @@ func (app *App) ContainerStats(params *types.ContainerStatsParams) (string, erro
 	fmt.Println("[stats]:", n, body)
 	return body, err
 }
-func (app *App) ContainerPutArchive(params *types.ContainerRequestParams) {}
-func (app *App) ContainerGetArchive(params *types.ContainerRequestParams) {}
+func (app *App) ContainerPutArchive(params *types.ContainerRequestParams, body *types.ContainerPutArchiveBody, savePath string) error {
+	ff, err := os.Open(savePath)
+	if err != nil {
+		log.Println("error reading file:", err.Error())
+		return err
+	}
+	defer ff.Close()
+	err = app.client.CopyToContainer(context.Background(), params.ID, body.DstPath, ff, container.CopyToContainerOptions{AllowOverwriteDirWithFile: true})
+	if err != nil {
+		return err
+	}
+	return nil
+}
+func (app *App) ContainerGetArchive(params *types.ContainerRequestParams, body *types.ContainerGetArchiveBody) ([]byte, string, error) {
+	r, stat, err := app.client.CopyFromContainer(context.Background(), params.ID, body.SrcPath)
+	if err != nil {
+		return []byte{}, "", err
+	}
+	buff := make([]byte, 0)
+	br := bytes.NewBuffer(buff)
+	_, err = io.Copy(br, r)
+	if err != nil {
+		return []byte{}, "", err
+	}
+	return br.Bytes(), stat.Name, nil
+}
 func (app *App) ContainerRename(params *types.ContainerRequestParams, body *types.ContainerRenameParams) error {
 	err := app.client.ContainerRename(context.Background(), params.ID, body.NewName)
 	return err
@@ -793,6 +875,7 @@ func (app *App) ContainerTerminal(ctx *gin.Context) {}
 func (app *App) ContainerExec(params *types.ContainerExecParams, body *types.ContainerExecBody) error {
 	cmd := strings.Split(body.Cmd, " ")
 	env := strings.Split(body.Env, " ")
+	fmt.Println("[exec#body]:", body)
 	exec, err := app.client.ContainerExecCreate(context.Background(), params.ID, container.ExecOptions{
 		Tty:          body.Tty,
 		AttachStdout: body.Stdout,
@@ -806,29 +889,32 @@ func (app *App) ContainerExec(params *types.ContainerExecParams, body *types.Con
 		Privileged:   body.Privileged,
 	})
 	if err != nil {
-		fmt.Println("[exec]:", err.Error())
+		fmt.Println("[exec#err]:", err.Error())
 		return err
 	}
 	err = app.client.ContainerExecStart(context.Background(), exec.ID, container.ExecStartOptions{
-		// Detach: body.Detach,
-		Tty: body.Tty,
+		Tty:    body.Tty,
+		Detach: body.Detach,
 	})
 	if err != nil {
-		fmt.Println("[execstart]:", err.Error())
+		fmt.Println("[execstart#err]:", err.Error())
 		return err
 	}
 	keepAlive := body.Tty && body.Stdin
 	if keepAlive {
-		hj, err := app.client.ContainerExecAttach(context.Background(), exec.ID, container.ExecStartOptions{})
+		hj, err := app.client.ContainerExecAttach(context.Background(), exec.ID, container.ExecStartOptions{
+			Tty:    body.Tty,
+			Detach: body.Detach,
+		})
 		if err != nil {
 			return err
 		}
 		fmt.Println("connection established:", params.ID)
-		attachedExec := app.AttachedExecs[params.ID]
+		/* attachedExec := app.AttachedExecs[params.ID]
 		if attachedExec != nil {
 			attachedExec.Close()
-		}
-		app.AttachedExecs[params.ID] = &hj
+		} */
+		// app.AttachedExecs[params.ID] = &hj
 
 		buf := bytes.Buffer{}
 		go func() {
@@ -845,6 +931,134 @@ func (app *App) ContainerExec(params *types.ContainerExecParams, body *types.Con
 
 	return nil
 }
+func (app *App) ContainerHostInfo(params *types.ContainerRequestParams, query *types.ContainerHostInfoQueryParams) (types.ContainerHostInfoQueryResponse, error) {
+	con, err := app.ContainerInspect(params)
+	res := types.ContainerHostInfoQueryResponse{}
+	if err != nil {
+		return res, err
+	}
+	if query.Hostname {
+		res.Hostname = con.Config.Hostname
+	}
+	if query.Username {
+		res.User = con.Config.User
+	}
+	if query.SSH {
+		sshContainerPort := fmt.Sprintf("%s/tcp", "2222")
+		sshPorts := con.NetworkSettings.Ports[nat.Port(sshContainerPort)]
+		if len(sshPorts) == 0 {
+			return res, nil
+		}
+		sshPort := sshPorts[0]
+		res.SSH = sshPort
+	}
+	if query.IP {
+		res.IP = con.NetworkSettings.IPAddress
+	}
+	return res, nil
+}
+func (app *App) ContainerShell(params *types.ContainerLsParams, body *types.ContainerLsBody) error {
+	return nil
+}
+func (app *App) ContainerLs(params *types.ContainerLsParams, body *types.ContainerLsBody) ([]types.ContainerFileInfo, int, int, error) {
+	cont, _ := app.ContainerInspect(&types.ContainerRequestParams{
+		CommonRequestParams: types.CommonRequestParams{
+			ID: params.ID,
+		},
+	})
+	files := make([]types.ContainerFileInfo, 0)
+	lsPort := fmt.Sprintf("%s/tcp", common.EXPLORER_PORT)
+	explorerPorts := cont.NetworkSettings.Ports[nat.Port(lsPort)]
+	if len(explorerPorts) == 0 {
+		return files, 0, 0, nil
+	}
+	explorerPort := explorerPorts[0]
+	exec, err := app.client.ContainerExecCreate(context.Background(), params.ID, container.ExecOptions{
+		Tty:          true,
+		AttachStdout: true,
+		AttachStderr: true,
+		Detach:       true,
+		Cmd:          []string{"/bin/lsx"},
+	})
+	if err != nil {
+		fmt.Println("[exec#err]:", err.Error())
+		return files, 0, 0, err
+	}
+	err = app.client.ContainerExecStart(context.Background(), exec.ID, container.ExecStartOptions{})
+	if err != nil {
+		fmt.Println("[execstart#err]:", err.Error())
+		return files, 0, 0, err
+	}
+	payload := map[string]any{"Path": body.Path}
+	jsonBody, _ := json.Marshal(payload)
+	hostIp := "0.0.0.0"
+	hostPort := common.EXPLORER_PORT
+	scheme := common.EXPLORER_SCHEME
+	if !common.DEBUG {
+		hostIp = explorerPort.HostIP
+		hostPort = explorerPort.HostPort
+	}
+	url := fmt.Sprintf("%s://%s:%s/ls", scheme, hostIp, hostPort)
+	log.Println("[url]:", url)
+	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonBody))
+	if err != nil {
+		return files, 0, 0, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Secret", common.AUTH_SECRET)
+	req.SetBasicAuth(common.AUTH_USER, common.AUTH_PASS)
+	client := http.DefaultClient
+	res, err := client.Do(req)
+	if err != nil {
+		log.Println("error sending request:", err.Error())
+		return files, 0, 0, err
+	}
+	defer res.Body.Close()
+	rec := types.ContainerLsResponseBody{}
+	err = json.NewDecoder(res.Body).Decode(&rec)
+	if err != nil {
+		log.Println("error parsing response json:", err.Error())
+		return files, 0, 0, err
+	}
+	files = append(files, rec.Folders...)
+	files = append(files, rec.Files...)
+	return files, rec.FolderCount, rec.FileCount, nil
+}
+func (app *App) ContainerLsStop(params *types.ContainerLsParams) error {
+	if common.DEBUG {
+		// return nil
+	}
+	cont, _ := app.ContainerInspect(&types.ContainerRequestParams{
+		CommonRequestParams: types.CommonRequestParams{
+			ID: params.ID,
+		},
+	})
+	port := fmt.Sprintf("%s/tcp", common.EXPLORER_PORT)
+	explorerPorts := cont.NetworkSettings.Ports[nat.Port(port)]
+	if len(explorerPorts) == 0 {
+		return nil
+	}
+	explorerPort := explorerPorts[0]
+	hostIp := explorerPort.HostIP
+	hostPort := explorerPort.HostPort
+	scheme := common.EXPLORER_SCHEME
+	url := fmt.Sprintf("%s://%s:%s/down", scheme, hostIp, hostPort)
+	log.Println("[stop#url]:", url)
+	req, err := http.NewRequest("PUT", url, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Secret", common.AUTH_SECRET)
+	req.SetBasicAuth(common.AUTH_USER, common.AUTH_PASS)
+	client := http.DefaultClient
+	_, err = client.Do(req)
+	if err != nil {
+		log.Println("error sending request:", err.Error())
+		return err
+	}
+	return nil
+}
 func (app *App) ContainerExecCommand(params *types.ContainerExecCommandParams) error {
 	hj := app.AttachedExecs[params.ID]
 	if hj == nil {
@@ -855,8 +1069,12 @@ func (app *App) ContainerExecCommand(params *types.ContainerExecCommandParams) e
 	hj.Conn.Write([]byte(params.Cmd))
 	return nil
 }
-func (app *App) ContainersPrune() {
-	app.client.ContainersPrune(context.Background(), filters.NewArgs(filters.Arg("", "")))
+func (app *App) ContainersPrune() (*container.PruneReport, error) {
+	rep, err := app.client.ContainersPrune(context.Background(), filters.NewArgs())
+	if err != nil {
+		return nil, err
+	}
+	return &rep, nil
 }
 
 func (app *App) ImagePull(params *types.ImagePullParams) (string, error) {
@@ -899,6 +1117,13 @@ func (app *App) ImageInspect(id string) (*dockertypes.ImageInspect, error) {
 	}
 	return &i, nil
 }
+func (app *App) ImagesPrune() (*image.PruneReport, error) {
+	report, err := app.client.ImagesPrune(context.Background(), filters.NewArgs())
+	if err != nil {
+		return nil, err
+	}
+	return &report, nil
+}
 
 func (app *App) VolumeInspect(id string) (*volume.Volume, error) {
 	v, err := app.client.VolumeInspect(context.Background(), id)
@@ -906,6 +1131,10 @@ func (app *App) VolumeInspect(id string) (*volume.Volume, error) {
 		return nil, err
 	}
 	return &v, nil
+}
+func (app *App) VolumeCreate() (*volume.Volume, error) {
+	v, err := app.client.VolumeCreate(context.Background(), volume.CreateOptions{Name: "data"})
+	return &v, err
 }
 func (app *App) NetworkInspect(id string) (*network.Inspect, error) {
 	n, err := app.client.NetworkInspect(context.Background(), id, network.InspectOptions{})
@@ -948,4 +1177,12 @@ func (app *App) TestConnection(idOrConnStr string, exact bool) (bool, string) {
 		return app.connectionManager.TestConnectionString(idOrConnStr)
 	}
 	return app.connectionManager.TestConnection(idOrConnStr)
+}
+func (app *App) SaveExplorable(containerId string) bool {
+	m := models.ContainerMeta{
+		ContainerId: containerId,
+		Explorable:  true,
+	}
+	ra := app.connectionManager.SaveExplorable(&m)
+	return ra == 1
 }
