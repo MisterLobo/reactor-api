@@ -27,6 +27,13 @@ type ConnectionConfig struct {
 	UpdatedAt time.Time
 	DeletedAt *time.Time `gorm:"index" json:"deleted_at"`
 }
+type ContainerMeta struct {
+	ID          string `gorm:"type:uuid;primarykey" json:"id"`
+	ContainerId string `gorm:"uniqueIndex" json:"container_id"`
+	Explorable  bool   `json:"explorable"`
+	HostIp      string `json:"host_ip"`
+	HostPort    string `json:"host_port"`
+}
 
 func (c *ConnectionConfig) BeforeCreate(tx *gorm.DB) error {
 	c.ID = uuid.NewString()
@@ -143,6 +150,19 @@ func (c *ConnectionManager) TestConnectionString(connStr string) (bool, string) 
 	}
 	return true, ""
 }
+func (c *ConnectionManager) SaveExplorable(p *ContainerMeta) int64 {
+	db := c.db
+	db.
+		Clauses(clause.OnConflict{DoNothing: true}).
+		Create(p)
+	return db.RowsAffected
+}
+func (c *ConnectionManager) GetUsedPorts() []ContainerMeta {
+	db := c.db
+	var rows []ContainerMeta
+	db.Find(&rows)
+	return rows
+}
 
 func setupDB() *gorm.DB {
 	configManager = utils.DefaultConfigurationManager()
@@ -151,6 +171,6 @@ func setupDB() *gorm.DB {
 	if err != nil {
 		panic(fmt.Sprintf("Failed to initialize DB: %s", err))
 	}
-	db.AutoMigrate(&ConnectionConfig{})
+	db.AutoMigrate(&ConnectionConfig{}, &ContainerMeta{})
 	return db
 }
